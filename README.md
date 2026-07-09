@@ -30,6 +30,13 @@ swift run MoyuReader
 open build/MoyuReader.app
 ```
 
+生成 DMG：
+
+```bash
+./Scripts/build_dmg.sh
+open build/MoyuReader-mac.dmg
+```
+
 ## Windows 版
 
 Windows 版在 `windows/` 目录，使用 Python + PySide6 实现。
