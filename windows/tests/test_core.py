@@ -7,6 +7,7 @@ from moyureader_win.models import EpubBook, EpubChapter, ReadingDocument
 from moyureader_win.scrolling import animation_interval_ms, next_offset, progress_percent, smoothed_offset
 from moyureader_win.settings import ReaderSettings
 from moyureader_win.store import LibraryStore, ProgressStore, ReadingProgress
+from moyureader_win.window_geometry import ResizeEdges, WindowGeometry, edge_at, resize_geometry
 
 
 def test_reading_document_returns_isolated_chapter_text() -> None:
@@ -92,3 +93,23 @@ def test_settings_clamp_more_appearance_options() -> None:
     assert settings.scroll_step == 72
     assert settings.font_family == "Microsoft YaHei UI"
     assert settings.text_color == "#5F6368"
+
+
+def test_window_geometry_detects_all_four_corners() -> None:
+    assert edge_at(2, 2, 720, 220) == ResizeEdges.TOP | ResizeEdges.LEFT
+    assert edge_at(718, 2, 720, 220) == ResizeEdges.TOP | ResizeEdges.RIGHT
+    assert edge_at(2, 218, 720, 220) == ResizeEdges.BOTTOM | ResizeEdges.LEFT
+    assert edge_at(718, 218, 720, 220) == ResizeEdges.BOTTOM | ResizeEdges.RIGHT
+
+
+def test_window_geometry_resizes_from_top_left_and_keeps_minimum() -> None:
+    start = WindowGeometry(100, 200, 720, 220)
+
+    resized = resize_geometry(start, -80, -60, ResizeEdges.TOP | ResizeEdges.LEFT)
+    assert resized == WindowGeometry(20, 140, 800, 280)
+
+    clamped = resize_geometry(start, 900, 900, ResizeEdges.TOP | ResizeEdges.LEFT)
+    assert clamped.width == 260
+    assert clamped.height == 100
+    assert clamped.right == start.right
+    assert clamped.bottom == start.bottom

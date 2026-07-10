@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QSystemTrayIcon,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -30,6 +31,17 @@ from .models import ReadingDocument
 from .scrolling import MAXIMUM_FPS, animation_interval_ms, next_offset, progress_percent, smoothed_offset
 from .settings import ReaderSettings
 from .store import LibraryStore, ProgressStore, ReadingProgress
+from .window_geometry import ResizeEdges, WindowGeometry, edge_at, resize_geometry
+
+
+def resource_path(name: str) -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        bundled = Path(bundle_root) / "Resources" / name
+        if bundled.exists():
+            return bundled
+
+    return Path(__file__).resolve().parents[1] / name
 
 
 class ReaderTextBrowser(QTextBrowser):
@@ -192,6 +204,11 @@ class ReaderWindow(QMainWindow):
         self.smooth_target: float | None = None
         self.preview_locked = False
         self._last_progress_label_text = ""
+        self._drag_start_global: QPoint | None = None
+        self._drag_start_position: QPoint | None = None
+        self._resize_start_global: QPoint | None = None
+        self._resize_start_geometry: WindowGeometry | None = None
+        self._resize_edges = ResizeEdges.NONE
         self.progress_timer = QTimer(self)
         self.progress_timer.setSingleShot(True)
         self.progress_timer.timeout.connect(self.save_progress)
@@ -201,25 +218,35 @@ class ReaderWindow(QMainWindow):
         self.scroll_timer.setInterval(animation_interval_ms(MAXIMUM_FPS))
         self.scroll_timer.timeout.connect(self.advance_smooth_scroll)
 
+        self.geometry_timer = QTimer(self)
+        self.geometry_timer.setSingleShot(True)
+        self.geometry_timer.setInterval(250)
+        self.geometry_timer.timeout.connect(self.settings.save)
+
         self.text = ReaderTextBrowser(self)
         self.chapter_box = QComboBox()
         self.previous_button = QPushButton("<")
         self.next_button = QPushButton(">")
         self.progress_label = QLabel("")
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_toggle_action: QAction | None = None
 
         self._configure_window()
         self._configure_ui()
+        self._configure_tray()
         self.apply_settings()
 
     def _configure_window(self) -> None:
         self.setWindowTitle("MoyuReader")
         self.resize(self.settings.width, self.settings.height)
+        self.setMinimumSize(260, 100)
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         if self.settings.keep_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
+        self.installEventFilter(self)
 
     def _configure_ui(self) -> None:
         central = QWidget()
@@ -244,6 +271,8 @@ class ReaderWindow(QMainWindow):
         nav.addWidget(self.next_button)
         layout.addLayout(nav)
         self.setCentralWidget(central)
+        for widget in (central, self.text, self.text.viewport()):
+            widget.installEventFilter(self)
 
         menu = self.menuBar()
         file_menu = menu.addMenu("文件")
@@ -252,6 +281,49 @@ class ReaderWindow(QMainWindow):
         self._add_action(file_menu, "设置...", self.open_settings)
         file_menu.addSeparator()
         self._add_action(file_menu, "退出", self.close)
+
+    def _configure_tray(self) -> None:
+        icon = QIcon(str(resource_path("AppIcon.png")))
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+            self.tray_icon.setIcon(icon)
+
+        self.tray_icon.setToolTip("MoyuReader")
+        tray_menu = QMenu(self)
+        self.tray_toggle_action = self._add_action(tray_menu, "隐藏窗口", self.toggle_window)
+        self._add_action(tray_menu, "打开 EPUB...", self.open_file_dialog)
+        self._add_action(tray_menu, "书库...", self.open_library)
+        self._add_action(tray_menu, "设置...", self.open_settings)
+        tray_menu.addSeparator()
+        self._add_action(tray_menu, "退出", self.quit_application)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.toggle_window()
+
+    def toggle_window(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+            if self.tray_toggle_action:
+                self.tray_toggle_action.setText("显示窗口")
+            return
+
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if self.tray_toggle_action:
+            self.tray_toggle_action.setText("隐藏窗口")
+
+    def quit_application(self) -> None:
+        self.tray_icon.hide()
+        QApplication.instance().quit()
 
     def _add_action(self, menu: QMenu, title: str, callback) -> QAction:
         action = QAction(title, self)
@@ -442,14 +514,105 @@ class ReaderWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         self.settings.width = self.width()
         self.settings.height = self.height()
-        self.settings.save()
+        self.geometry_timer.start()
         self.update_progress_label()
         super().resizeEvent(event)
+
+    def eventFilter(self, watched, event: QEvent) -> bool:
+        if not self._is_interaction_surface(watched):
+            return super().eventFilter(watched, event)
+
+        if event.type() == QEvent.Type.MouseButtonPress:
+            mouse_event = event
+            if isinstance(mouse_event, QMouseEvent) and mouse_event.button() == Qt.MouseButton.LeftButton:
+                self._begin_window_interaction(mouse_event.globalPosition().toPoint())
+                return True
+
+        if event.type() == QEvent.Type.MouseMove:
+            mouse_event = event
+            if isinstance(mouse_event, QMouseEvent):
+                global_pos = mouse_event.globalPosition().toPoint()
+                if self._drag_start_global is not None:
+                    self._move_window(global_pos)
+                    return True
+                if self._resize_start_global is not None:
+                    self._resize_window(global_pos)
+                    return True
+                self._update_resize_cursor(global_pos)
+
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            mouse_event = event
+            if isinstance(mouse_event, QMouseEvent) and mouse_event.button() == Qt.MouseButton.LeftButton:
+                self._end_window_interaction()
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def _is_interaction_surface(self, watched) -> bool:
+        return watched in {self, self.centralWidget(), self.text, self.text.viewport()}
+
+    def _begin_window_interaction(self, global_pos: QPoint) -> None:
+        local_pos = self.mapFromGlobal(global_pos)
+        edges = edge_at(local_pos.x(), local_pos.y(), self.width(), self.height())
+        if edges != ResizeEdges.NONE:
+            geometry = self.geometry()
+            self._resize_edges = edges
+            self._resize_start_global = global_pos
+            self._resize_start_geometry = WindowGeometry(
+                geometry.x(), geometry.y(), geometry.width(), geometry.height()
+            )
+            return
+
+        self._drag_start_global = global_pos
+        self._drag_start_position = self.pos()
+
+    def _move_window(self, global_pos: QPoint) -> None:
+        if self._drag_start_global is None or self._drag_start_position is None:
+            return
+        delta = global_pos - self._drag_start_global
+        self.move(self._drag_start_position + delta)
+
+    def _resize_window(self, global_pos: QPoint) -> None:
+        if self._resize_start_global is None or self._resize_start_geometry is None:
+            return
+        delta = global_pos - self._resize_start_global
+        resized = resize_geometry(
+            self._resize_start_geometry,
+            delta.x(),
+            delta.y(),
+            self._resize_edges,
+        )
+        self.setGeometry(resized.x, resized.y, resized.width, resized.height)
+
+    def _end_window_interaction(self) -> None:
+        self._drag_start_global = None
+        self._drag_start_position = None
+        self._resize_start_global = None
+        self._resize_start_geometry = None
+        self._resize_edges = ResizeEdges.NONE
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _update_resize_cursor(self, global_pos: QPoint) -> None:
+        local_pos = self.mapFromGlobal(global_pos)
+        edges = edge_at(local_pos.x(), local_pos.y(), self.width(), self.height())
+        cursor_map = {
+            ResizeEdges.TOP | ResizeEdges.LEFT: Qt.CursorShape.SizeFDiagCursor,
+            ResizeEdges.BOTTOM | ResizeEdges.RIGHT: Qt.CursorShape.SizeFDiagCursor,
+            ResizeEdges.TOP | ResizeEdges.RIGHT: Qt.CursorShape.SizeBDiagCursor,
+            ResizeEdges.BOTTOM | ResizeEdges.LEFT: Qt.CursorShape.SizeBDiagCursor,
+            ResizeEdges.LEFT: Qt.CursorShape.SizeHorCursor,
+            ResizeEdges.RIGHT: Qt.CursorShape.SizeHorCursor,
+            ResizeEdges.TOP: Qt.CursorShape.SizeVerCursor,
+            ResizeEdges.BOTTOM: Qt.CursorShape.SizeVerCursor,
+        }
+        self.setCursor(cursor_map.get(edges, Qt.CursorShape.ArrowCursor))
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("MoyuReader")
+    app.setWindowIcon(QIcon(str(resource_path("AppIcon.png"))))
+    app.setQuitOnLastWindowClosed(True)
     window = ReaderWindow()
     if len(sys.argv) > 1:
         window.load_book(Path(sys.argv[1]))
