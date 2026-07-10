@@ -16,7 +16,7 @@ Windows 版摸鱼 EPUB 阅读器。
 
 ```powershell
 cd windows
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m moyureader_win
 ```
@@ -29,25 +29,34 @@ py -3.11 -m venv .venv
 
 ## 打包 exe
 
-在 Windows 电脑上运行：
+在 Windows CMD 中运行：
+
+```bat
+cd windows
+build_windows.bat
+```
+
+也可以在 PowerShell 中运行：
 
 ```powershell
 cd windows
 .\build_windows.ps1
 ```
 
-脚本会自动检测 Python 3.11。没有 Python 3.11 时，会优先用 `winget` 自动安装；没有 `winget` 时，会从 python.org 下载 Python 3.11 当前用户安装包并静默安装。
+脚本会自动检测 Python 3.12。没有 Python 3.12 时，会优先用 `winget` 自动安装；没有 `winget` 时，会从 python.org 下载 Python 3.12.10 当前用户安装包并静默安装。
 
 这个目录是自包含的，直接把 `windows` 文件夹压缩到 Windows 电脑即可。
 
 输出文件：
 
 ```text
-windows\dist\MoyuReader\MoyuReader.exe
+windows\dist\MoyuReader.exe
 ```
+
+这是包含 Python 和 PySide6 运行环境的单文件 EXE，目标电脑不需要安装 Python。
 
 如果想重新干净打包：
 
-```powershell
-.\build_windows.ps1 -Clean
+```bat
+build_windows.bat -Clean
 ```

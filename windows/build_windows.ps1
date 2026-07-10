@@ -6,11 +6,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-function Get-Python311Path {
+function Get-Python312Path {
     $launcher = Get-Command py -ErrorAction SilentlyContinue
     if ($launcher) {
         try {
-            $path = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1).Trim()
+            $path = (& py -3.12 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1).Trim()
             if ($path -and (Test-Path $path)) {
                 return $path
             }
@@ -19,9 +19,9 @@ function Get-Python311Path {
     }
 
     $candidates = @(
-        "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-        "$env:ProgramFiles\Python311\python.exe",
-        "${env:ProgramFiles(x86)}\Python311\python.exe"
+        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:ProgramFiles\Python312\python.exe",
+        "${env:ProgramFiles(x86)}\Python312\python.exe"
     )
     foreach ($candidate in $candidates) {
         if ($candidate -and (Test-Path $candidate)) {
@@ -37,7 +37,7 @@ function Get-Python311Path {
 
         try {
             $version = (& $command.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -Last 1).Trim()
-            if ($version -eq "3.11") {
+            if ($version -eq "3.12") {
                 return $command.Source
             }
         } catch {
@@ -47,77 +47,103 @@ function Get-Python311Path {
     return $null
 }
 
-function Install-Python311 {
-    Write-Host "未检测到 Python 3.11，开始自动安装..."
+function Assert-ExitCode {
+    param(
+        [string]$Step,
+        [int]$ExitCode
+    )
+
+    if ($ExitCode -ne 0) {
+        throw "$Step failed with exit code $ExitCode."
+    }
+}
+
+function Install-Python312 {
+    Write-Host "Python 3.12 was not found. Installing it now..."
 
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         & winget install `
-            --id Python.Python.3.11 `
+            --id Python.Python.3.12 `
             --exact `
             --source winget `
             --scope user `
             --silent `
             --accept-package-agreements `
             --accept-source-agreements
-        if ($LASTEXITCODE -ne 0) {
-            throw "winget 安装 Python 3.11 失败。"
-        }
+        Assert-ExitCode "winget Python installation" $LASTEXITCODE
     } else {
-        $installerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-        $installerPath = Join-Path $env:TEMP "python-3.11.9-amd64.exe"
-        Write-Host "未检测到 winget，改用 python.org 安装器：$installerUrl"
+        $installerUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+        $installerPath = Join-Path $env:TEMP "python-3.12.10-amd64.exe"
+        Write-Host "winget was not found. Downloading Python from $installerUrl"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
         & $installerPath /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1 Include_test=0
-        if ($LASTEXITCODE -ne 0) {
-            throw "python.org 安装器执行失败。"
-        }
+        Assert-ExitCode "python.org Python installation" $LASTEXITCODE
     }
 
-    $pythonPath = Get-Python311Path
+    $pythonPath = Get-Python312Path
     if (!$pythonPath) {
-        throw "Python 3.11 已安装，但当前 PowerShell 仍未定位到 python.exe。请重新打开 PowerShell 后再运行本脚本。"
+        throw "Python 3.12 was installed, but python.exe could not be located. Reopen the terminal and run this script again."
     }
 
     return $pythonPath
 }
 
+$LogPath = Join-Path $Root "build_windows.log"
+$TranscriptStarted = $false
+try {
+    Start-Transcript -Path $LogPath -Force | Out-Null
+    $TranscriptStarted = $true
+} catch {
+    Write-Warning "Build logging could not be started: $_"
+}
+
+try {
 if ($Clean) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue build, dist, .venv
 }
 
-$PythonExe = Get-Python311Path
+$PythonExe = Get-Python312Path
 if (!$PythonExe) {
-    $PythonExe = Install-Python311
+    $PythonExe = Install-Python312
 }
-Write-Host "使用 Python：$PythonExe"
+Write-Host "Using Python: $PythonExe"
 
-if (!(Test-Path .venv)) {
+$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
+if ((Test-Path .venv) -and !(Test-Path $VenvPython)) {
+    Remove-Item -Recurse -Force .venv
+}
+if (Test-Path $VenvPython) {
+    $VenvVersion = (& $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -Last 1).Trim()
+    if ($VenvVersion -ne "3.12") {
+        Write-Host "Recreating virtual environment for Python 3.12..."
+        Remove-Item -Recurse -Force .venv
+    }
+}
+if (!(Test-Path $VenvPython)) {
     & $PythonExe -m venv .venv
+    Assert-ExitCode "virtual environment creation" $LASTEXITCODE
 }
 
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-& .\.venv\Scripts\python.exe -m pytest
+& $VenvPython -m pip install --upgrade pip
+Assert-ExitCode "pip upgrade" $LASTEXITCODE
+& $VenvPython -m pip install -r requirements.txt
+Assert-ExitCode "dependency installation" $LASTEXITCODE
+& $VenvPython -m pytest
+Assert-ExitCode "test suite" $LASTEXITCODE
 
 $IconArgs = @()
 $DataArgs = @()
 $PngIconPath = Join-Path $Root "AppIcon.png"
 $IconPath = Join-Path $Root "AppIcon.ico"
+$IconScriptPath = Join-Path $Root "make_icon.py"
+$LauncherPath = Join-Path $Root "moyureader_launcher.py"
 if (!(Test-Path $IconPath)) {
-    & .\.venv\Scripts\python.exe -m pip install Pillow
-    $IconScript = @"
-from pathlib import Path
-from PIL import Image
-
-root = Path(r"$Root")
-source = root / "AppIcon.png"
-target = root / "AppIcon.ico"
-if source.exists():
-    image = Image.open(source).convert("RGBA")
-    image.save(target, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-"@
-    & .\.venv\Scripts\python.exe -c $IconScript
+    & $VenvPython -m pip install Pillow
+    Assert-ExitCode "Pillow installation" $LASTEXITCODE
+    & $VenvPython $IconScriptPath
+    Assert-ExitCode "Windows icon generation" $LASTEXITCODE
 }
 if (Test-Path $IconPath) {
     $IconArgs = @("--icon", $IconPath)
@@ -126,12 +152,20 @@ if (Test-Path $PngIconPath) {
     $DataArgs = @("--add-data", "$PngIconPath;Resources")
 }
 
-& .\.venv\Scripts\pyinstaller.exe `
+& $VenvPython -m PyInstaller `
     --noconfirm `
+    --clean `
     --windowed `
+    --onefile `
     --name MoyuReader `
     @IconArgs `
     @DataArgs `
-    -m moyureader_win
+    $LauncherPath
+Assert-ExitCode "PyInstaller build" $LASTEXITCODE
 
-Write-Host "Windows 可执行文件：$Root\dist\MoyuReader\MoyuReader.exe"
+Write-Host "Windows executable: $Root\dist\MoyuReader.exe"
+} finally {
+    if ($TranscriptStarted) {
+        Stop-Transcript | Out-Null
+    }
+}

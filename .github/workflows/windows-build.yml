@@ -1,0 +1,48 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: windows/requirements.txt
+
+      - name: Build executable
+        shell: powershell
+        working-directory: windows
+        run: .\build_windows.ps1 -Clean
+
+      - name: Verify executable
+        shell: powershell
+        run: |
+          if (!(Test-Path "windows/dist/MoyuReader.exe")) {
+            throw "windows/dist/MoyuReader.exe was not created."
+          }
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoyuReader-Windows
+          path: |
+            windows/dist/MoyuReader.exe
+            windows/build_windows.log
+          if-no-files-found: error
