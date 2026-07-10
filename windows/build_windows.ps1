@@ -4,6 +4,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BuildRoot = Join-Path $env:LOCALAPPDATA "MoyuReaderBuild"
+$VenvDir = Join-Path $BuildRoot ".venv"
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+$PyInstallerWorkPath = Join-Path $BuildRoot "build"
+$DistPath = Join-Path $Root "dist"
 Set-Location $Root
 
 function Get-Python312Path {
@@ -101,8 +106,9 @@ try {
 
 try {
 if ($Clean) {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue build, dist, .venv
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue build, dist, .venv, $BuildRoot
 }
+New-Item -ItemType Directory -Path $BuildRoot -Force | Out-Null
 
 $PythonExe = Get-Python312Path
 if (!$PythonExe) {
@@ -110,19 +116,18 @@ if (!$PythonExe) {
 }
 Write-Host "Using Python: $PythonExe"
 
-$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
-if ((Test-Path .venv) -and !(Test-Path $VenvPython)) {
-    Remove-Item -Recurse -Force .venv
+if ((Test-Path $VenvDir) -and !(Test-Path $VenvPython)) {
+    Remove-Item -Recurse -Force $VenvDir
 }
 if (Test-Path $VenvPython) {
     $VenvVersion = (& $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -Last 1).Trim()
     if ($VenvVersion -ne "3.12") {
         Write-Host "Recreating virtual environment for Python 3.12..."
-        Remove-Item -Recurse -Force .venv
+        Remove-Item -Recurse -Force $VenvDir
     }
 }
 if (!(Test-Path $VenvPython)) {
-    & $PythonExe -m venv .venv
+    & $PythonExe -m venv $VenvDir
     Assert-ExitCode "virtual environment creation" $LASTEXITCODE
 }
 
@@ -158,6 +163,9 @@ if (Test-Path $PngIconPath) {
     --windowed `
     --onefile `
     --name MoyuReader `
+    --distpath $DistPath `
+    --workpath $PyInstallerWorkPath `
+    --specpath $BuildRoot `
     @IconArgs `
     @DataArgs `
     $LauncherPath
