@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settings = ReaderSettings.load()
     private let progressStore = ReadingProgressStore()
     private let bookLibraryStore = BookLibraryStore()
-    private let parser = EpubParser()
 
     private var statusItem: NSStatusItem?
     private var readerWindowController: ReaderWindowController?
@@ -15,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var bookLibraryWindowController: BookLibraryWindowController?
     private var colorPanelCloseObserver: NSObjectProtocol?
     private var currentBook: EpubBook?
+    private var bookCache: [String: EpubBook] = [:]
+    private var latestLoadRequestID = UUID()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
@@ -327,27 +328,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadBook(at url: URL, showErrors: Bool) {
-        do {
-            let book = try parser.parse(url)
-            currentBook = book
-            bookLibraryStore.recordOpened(book: book)
-            bookLibraryWindowController?.reload()
-            settings.lastBookPath = url.path
-            settings.save()
+        let requestID = UUID()
+        latestLoadRequestID = requestID
+        let inMemoryBook = bookCache[url.path]
 
-            let controller = readerWindowController ?? ReaderWindowController(
-                settings: settings,
-                progressStore: progressStore
-            )
-            readerWindowController = controller
-            controller.load(book: book)
-            showReaderWindow()
-            controller.revealTemporarily()
-        } catch {
-            if showErrors {
-                showOpenError(error)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { () throws -> PreparedBook in
+                if let inMemoryBook {
+                    return PreparedBook(book: inMemoryBook, document: ReadingDocument(book: inMemoryBook))
+                }
+
+                if let cachedBook = BookParseCache().book(for: url) {
+                    return PreparedBook(book: cachedBook, document: ReadingDocument(book: cachedBook))
+                }
+
+                let book = try EpubParser().parse(url)
+                BookParseCache().store(book, for: url)
+                return PreparedBook(book: book, document: ReadingDocument(book: book))
+            }
+            DispatchQueue.main.async {
+                guard let self, self.latestLoadRequestID == requestID else {
+                    return
+                }
+
+                switch result {
+                case .success(let preparedBook):
+                    self.bookCache[url.path] = preparedBook.book
+                    self.finishLoading(preparedBook, at: url)
+                case .failure(let error):
+                    if showErrors {
+                        self.showOpenError(error)
+                    }
+                }
             }
         }
+    }
+
+    private func finishLoading(_ preparedBook: PreparedBook, at url: URL) {
+        let book = preparedBook.book
+        currentBook = book
+        bookLibraryStore.recordOpened(book: book)
+        bookLibraryWindowController?.reload()
+        settings.lastBookPath = url.path
+        settings.save()
+
+        let controller = readerWindowController ?? ReaderWindowController(
+            settings: settings,
+            progressStore: progressStore
+        )
+        controller.onOpenLibrary = { [weak self] in
+            self?.showLibrary()
+        }
+        controller.onOpenSettings = { [weak self] in
+            self?.showSettings()
+        }
+        readerWindowController = controller
+        controller.load(book: book, document: preparedBook.document)
+        showReaderWindow()
+        controller.revealTemporarily()
     }
 
     private func showReaderWindow() {
@@ -438,6 +476,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+}
+
+private struct PreparedBook: Sendable {
+    let book: EpubBook
+    let document: ReadingDocument
 }
 
 private enum ReaderOpacityOption: Double, CaseIterable {

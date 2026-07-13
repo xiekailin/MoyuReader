@@ -32,6 +32,7 @@ final class ReaderWindowController: NSWindowController, NSWindowDelegate {
         panel.acceptsMouseMovedEvents = true
         panel.ignoresMouseEvents = false
         panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
         panel.level = settings.keepWindowOnTop ? .floating : .normal
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
@@ -40,6 +41,15 @@ final class ReaderWindowController: NSWindowController, NSWindowDelegate {
 
         super.init(window: panel)
         panel.delegate = self
+        panel.readerKeyDownHandler = { [weak self] event in
+            self?.readerView.handleReaderArrowKey(event) ?? false
+        }
+        readerView.onOpenLibrary = { [weak self] in
+            self?.onOpenLibrary?()
+        }
+        readerView.onOpenSettings = { [weak self] in
+            self?.onOpenSettings?()
+        }
         readerView.onReadingProgressChanged = { [weak self] in
             self?.scheduleScrollSync()
         }
@@ -47,13 +57,15 @@ final class ReaderWindowController: NSWindowController, NSWindowDelegate {
         observeScrolling()
     }
 
+    var onOpenLibrary: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func load(book: EpubBook) {
+    func load(book: EpubBook, document: ReadingDocument) {
         currentBookPath = book.sourceURL.path
-        let document = ReadingDocument(book: book)
         currentDocument = document
 
         let progress = progressStore.progress(for: book.sourceURL.path)
@@ -139,6 +151,8 @@ final class ReaderContentView: NSView {
     private let scrollView = CapturingScrollView()
     private let textView = StealthTextView()
     private let chapterPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let libraryButton = NSButton()
+    private let settingsButton = NSButton()
     private let hudView = NSView()
     private let previousChapterButton = NSButton(title: "<", target: nil, action: nil)
     private let nextChapterButton = NSButton(title: ">", target: nil, action: nil)
@@ -164,6 +178,8 @@ final class ReaderContentView: NSView {
     private var isAppearancePreviewing = false
     private var lastProgressLabelText = ""
     var onReadingProgressChanged: (() -> Void)?
+    var onOpenLibrary: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
 
     var clipView: NSClipView {
         scrollView.contentView
@@ -239,12 +255,14 @@ final class ReaderContentView: NSView {
         )
         addTrackingArea(area)
         trackingArea = area
+
     }
 
     override func mouseEntered(with event: NSEvent) {
         isMouseInside = true
         pendingHide?.cancel()
         makeWindowKeyIfNeeded()
+        window?.makeFirstResponder(self)
         refreshAdaptiveTextColor()
         ensureAdaptiveColorTimer()
         setProgressVisible(true)
@@ -253,7 +271,6 @@ final class ReaderContentView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         isMouseInside = false
-        NSCursor.arrow.set()
         guard !isAppearancePreviewing else {
             return
         }
@@ -263,14 +280,15 @@ final class ReaderContentView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        updateResizeCursor(for: event)
+        super.mouseMoved(with: event)
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        updateResizeCursor(for: event)
+        super.cursorUpdate(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
+        makeWindowKeyIfNeeded()
         window?.makeFirstResponder(textView)
 
         if let edge = resizeEdge(for: event), let window {
@@ -281,7 +299,6 @@ final class ReaderContentView: NSView {
                 startScreenPoint: NSEvent.mouseLocation,
                 anchorCharacterIndex: textView.firstVisibleCharacterIndex()
             )
-            resizeCursor(for: edge).set()
             return
         }
 
@@ -313,14 +330,13 @@ final class ReaderContentView: NSView {
         window.setFrame(resized.nsRect, display: true)
         updateTextViewSize()
         scrollToCharacterIndex(resizeDrag.anchorCharacterIndex)
-        resizeCursor(for: resizeDrag.edge).set()
     }
 
     override func mouseUp(with event: NSEvent) {
         if resizeDrag != nil {
             resizeDrag = nil
             refreshCurrentChapterFromVisibleText()
-            updateResizeCursor(for: event)
+            window?.invalidateCursorRects(for: self)
             return
         }
 
@@ -329,6 +345,55 @@ final class ReaderContentView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         handleCapturedScrollWheel(event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if handleReaderArrowKey(event) {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func handleReaderArrowKey(_ event: NSEvent) -> Bool {
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        guard
+            event.modifierFlags.intersection(disallowedModifiers).isEmpty,
+            isMouseInside
+        else {
+            return false
+        }
+
+        guard let action = ReaderKeyboardNavigation.action(forKeyCode: event.keyCode) else {
+            return false
+        }
+
+        switch action {
+        case .scrollUp:
+            scrollSmoothly(to: verticalOffset - currentSettings.scrollStep)
+            return true
+        case .scrollDown:
+            scrollSmoothly(to: verticalOffset + currentSettings.scrollStep)
+            return true
+        case .previousChapter, .nextChapter:
+            break
+        }
+
+        guard let document else {
+            return false
+        }
+
+        let direction: ReaderChapterNavigation.Direction = action == .previousChapter ? .previous : .next
+
+        guard let destination = ReaderChapterNavigation.destination(
+            current: currentChapterIndex,
+            total: document.chapters.count,
+            direction: direction
+        ) else {
+            return true
+        }
+
+        showChapter(at: destination, offset: 0, notifyProgress: true)
+        return true
     }
 
     func setDocument(_ document: ReadingDocument, chapterIndex: Int = 0) {
@@ -513,14 +578,44 @@ final class ReaderContentView: NSView {
         chapterPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         hudView.addSubview(chapterPopup)
 
+        libraryButton.translatesAutoresizingMaskIntoConstraints = false
+        libraryButton.bezelStyle = .texturedRounded
+        libraryButton.controlSize = .small
+        libraryButton.image = NSImage(systemSymbolName: "books.vertical", accessibilityDescription: "打开书库")
+        libraryButton.imagePosition = .imageOnly
+        libraryButton.toolTip = "打开书库"
+        libraryButton.target = self
+        libraryButton.action = #selector(libraryButtonClicked(_:))
+        hudView.addSubview(libraryButton)
+
+        settingsButton.translatesAutoresizingMaskIntoConstraints = false
+        settingsButton.bezelStyle = .texturedRounded
+        settingsButton.controlSize = .small
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "打开设置")
+        settingsButton.imagePosition = .imageOnly
+        settingsButton.toolTip = "打开设置"
+        settingsButton.target = self
+        settingsButton.action = #selector(settingsButtonClicked(_:))
+        hudView.addSubview(settingsButton)
+
         NSLayoutConstraint.activate([
             hudView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             hudView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             hudView.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             hudView.heightAnchor.constraint(equalToConstant: 28),
 
-            chapterPopup.leadingAnchor.constraint(equalTo: hudView.leadingAnchor),
-            chapterPopup.trailingAnchor.constraint(equalTo: hudView.trailingAnchor),
+            libraryButton.leadingAnchor.constraint(equalTo: hudView.leadingAnchor),
+            libraryButton.centerYAnchor.constraint(equalTo: hudView.centerYAnchor),
+            libraryButton.widthAnchor.constraint(equalToConstant: 28),
+            libraryButton.heightAnchor.constraint(equalToConstant: 24),
+
+            chapterPopup.leadingAnchor.constraint(equalTo: libraryButton.trailingAnchor, constant: 6),
+            settingsButton.trailingAnchor.constraint(equalTo: hudView.trailingAnchor),
+            settingsButton.centerYAnchor.constraint(equalTo: hudView.centerYAnchor),
+            settingsButton.widthAnchor.constraint(equalToConstant: 28),
+            settingsButton.heightAnchor.constraint(equalToConstant: 24),
+
+            chapterPopup.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -6),
             chapterPopup.centerYAnchor.constraint(equalTo: hudView.centerYAnchor)
         ])
     }
@@ -589,6 +684,14 @@ final class ReaderContentView: NSView {
 
     @objc private func chapterPopupChanged(_ sender: NSPopUpButton) {
         scrollToChapter(at: sender.indexOfSelectedItem)
+    }
+
+    @objc private func libraryButtonClicked(_ sender: NSButton) {
+        onOpenLibrary?()
+    }
+
+    @objc private func settingsButtonClicked(_ sender: NSButton) {
+        onOpenSettings?()
     }
 
     @objc private func previousChapterButtonClicked(_ sender: NSButton) {
@@ -679,15 +782,38 @@ final class ReaderContentView: NSView {
         )
     }
 
-    private func updateResizeCursor(for event: NSEvent) {
-        guard resizeDrag == nil else {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+
+        let width = bounds.width
+        let height = bounds.height
+        guard width > 0, height > 0 else {
             return
         }
 
-        if let edge = resizeEdge(for: event) {
-            resizeCursor(for: edge).set()
-        } else {
-            NSCursor.arrow.set()
+        let slop = min(resizeHitSlop, min(width, height) / 2)
+        addCursorRect(NSRect(x: 0, y: 0, width: slop, height: height), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: width - slop, y: 0, width: slop, height: height), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: 0, y: 0, width: width, height: slop), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: 0, y: height - slop, width: width, height: slop), cursor: .resizeUpDown)
+
+        for edge: ReaderResizeGeometry.Edge in [.topLeft, .topRight, .bottomLeft, .bottomRight] {
+            addCursorRect(cursorRect(for: edge, slop: slop), cursor: resizeCursor(for: edge))
+        }
+    }
+
+    private func cursorRect(for edge: ReaderResizeGeometry.Edge, slop: CGFloat) -> NSRect {
+        switch edge {
+        case .topLeft:
+            NSRect(x: 0, y: bounds.height - slop, width: slop, height: slop)
+        case .topRight:
+            NSRect(x: bounds.width - slop, y: bounds.height - slop, width: slop, height: slop)
+        case .bottomLeft:
+            NSRect(x: 0, y: 0, width: slop, height: slop)
+        case .bottomRight:
+            NSRect(x: bounds.width - slop, y: 0, width: slop, height: slop)
+        case .left, .right, .top, .bottom:
+            .zero
         }
     }
 
@@ -1007,11 +1133,21 @@ final class ReaderContentView: NSView {
     }
 
     private func makeWindowKeyIfNeeded() {
-        guard let window, !window.isKeyWindow else {
+        guard let window else {
             return
         }
 
-        window.makeKeyAndOrderFront(nil)
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        if !window.isKeyWindow {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func activateForKeyboard() {
+        isMouseInside = true
+        makeWindowKeyIfNeeded()
     }
 }
 
@@ -1040,12 +1176,21 @@ private extension ReaderResizeGeometry.Rect {
 }
 
 final class ReaderPanel: NSPanel {
+    var readerKeyDownHandler: ((NSEvent) -> Bool)?
+
     override var canBecomeKey: Bool {
         true
     }
 
     override var canBecomeMain: Bool {
-        false
+        true
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, readerKeyDownHandler?(event) == true {
+            return
+        }
+        super.sendEvent(event)
     }
 }
 
@@ -1084,11 +1229,19 @@ final class StealthTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        enclosingReaderContentView?.activateForKeyboard()
         if event.modifierFlags.contains(.option) {
             window?.performDrag(with: event)
         } else {
             super.mouseDown(with: event)
         }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if let readerView = enclosingReaderContentView, readerView.handleReaderArrowKey(event) {
+            return
+        }
+        super.keyDown(with: event)
     }
 
     func firstVisibleCharacterIndex() -> Int {

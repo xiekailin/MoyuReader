@@ -1,6 +1,6 @@
 import Foundation
 
-public struct ReadingDocument: Equatable {
+public struct ReadingDocument: Equatable, Sendable {
     public let title: String
     public let text: String
     public let chapters: [ReadingDocumentChapter]
@@ -74,7 +74,7 @@ public struct ReadingDocument: Equatable {
     }
 }
 
-public struct ReadingDocumentChapter: Equatable, Identifiable {
+public struct ReadingDocumentChapter: Equatable, Identifiable, Sendable {
     public var id: Int { index }
 
     public let index: Int

@@ -5,7 +5,19 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QMouseEvent, QWheelEvent
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QFont,
+    QIcon,
+    QKeyEvent,
+    QMouseEvent,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -27,7 +39,9 @@ from PySide6.QtWidgets import (
 )
 
 from .epub import EpubParseError, EpubParser
+from .chapter_navigation import ChapterDirection, chapter_destination
 from .models import ReadingDocument
+from .reader_formatting import line_height_percent
 from .scrolling import MAXIMUM_FPS, animation_interval_ms, next_offset, progress_percent, smoothed_offset
 from .settings import ReaderSettings
 from .store import LibraryStore, ProgressStore, ReadingProgress
@@ -54,11 +68,27 @@ class ReaderTextBrowser(QTextBrowser):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        parent = self.parent()
-        if isinstance(parent, ReaderWindow):
-            parent.handle_wheel(event)
+        reader = self.reader_window()
+        if reader:
+            reader.handle_wheel(event)
             return
         super().wheelEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        reader = self.reader_window()
+        if reader and reader.handle_chapter_key(
+            event, mouse_over_text=self.underMouse() or self.viewport().underMouse()
+        ):
+            return
+        super().keyPressEvent(event)
+
+    def reader_window(self) -> ReaderWindow | None:
+        widget: QWidget | None = self
+        while widget is not None:
+            if isinstance(widget, ReaderWindow):
+                return widget
+            widget = widget.parentWidget()
+        return None
 
 
 class SettingsDialog(QDialog):
@@ -203,12 +233,14 @@ class ReaderWindow(QMainWindow):
         self.current_book_path: Path | None = None
         self.smooth_target: float | None = None
         self.preview_locked = False
+        self._mouse_inside = False
         self._last_progress_label_text = ""
         self._drag_start_global: QPoint | None = None
         self._drag_start_position: QPoint | None = None
         self._resize_start_global: QPoint | None = None
         self._resize_start_geometry: WindowGeometry | None = None
         self._resize_edges = ResizeEdges.NONE
+        self._resize_widgets: tuple[QWidget, ...] = ()
         self.progress_timer = QTimer(self)
         self.progress_timer.setSingleShot(True)
         self.progress_timer.timeout.connect(self.save_progress)
@@ -222,6 +254,11 @@ class ReaderWindow(QMainWindow):
         self.geometry_timer.setSingleShot(True)
         self.geometry_timer.setInterval(250)
         self.geometry_timer.timeout.connect(self.settings.save)
+
+        self.hover_leave_timer = QTimer(self)
+        self.hover_leave_timer.setSingleShot(True)
+        self.hover_leave_timer.setInterval(80)
+        self.hover_leave_timer.timeout.connect(self._confirm_mouse_left)
 
         self.text = ReaderTextBrowser(self)
         self.chapter_box = QComboBox()
@@ -250,6 +287,7 @@ class ReaderWindow(QMainWindow):
 
     def _configure_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("readerCentral")
         layout = QVBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
@@ -271,8 +309,6 @@ class ReaderWindow(QMainWindow):
         nav.addWidget(self.next_button)
         layout.addLayout(nav)
         self.setCentralWidget(central)
-        for widget in (central, self.text, self.text.viewport()):
-            widget.installEventFilter(self)
 
         menu = self.menuBar()
         file_menu = menu.addMenu("文件")
@@ -281,6 +317,21 @@ class ReaderWindow(QMainWindow):
         self._add_action(file_menu, "设置...", self.open_settings)
         file_menu.addSeparator()
         self._add_action(file_menu, "退出", self.close)
+
+        self._resize_widgets = (
+            self,
+            central,
+            self.text,
+            self.text.viewport(),
+            self.menuBar(),
+            self.chapter_box,
+            self.previous_button,
+            self.next_button,
+            self.progress_label,
+        )
+        for widget in self._resize_widgets:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
 
     def _configure_tray(self) -> None:
         icon = QIcon(str(resource_path("AppIcon.png")))
@@ -332,38 +383,131 @@ class ReaderWindow(QMainWindow):
         return action
 
     def apply_settings(self) -> None:
-        font = QFont(self.settings.font_family)
-        font.setPointSize(self.settings.font_size)
+        font = self._reader_font()
         self.text.setFont(font)
+        self._apply_document_format(font)
         background_alpha = int(self.settings.background_opacity * 255)
-        self.text.setStyleSheet(
+        self.setStyleSheet(
             f"""
+            QMainWindow, QWidget#readerCentral {{
+                background: transparent;
+            }}
             QTextBrowser {{
                 color: {self.settings.text_color};
                 background: rgba(0, 0, 0, {background_alpha});
-                line-height: {self.settings.font_size + self.settings.line_spacing}px;
+                border: none;
             }}
-            QScrollBar:vertical {{ width: 8px; }}
+            QMenuBar {{
+                color: {self.settings.text_color};
+                background: transparent;
+                border: none;
+                padding: 0px 2px;
+            }}
+            QMenuBar::item {{
+                background: transparent;
+                padding: 2px 5px;
+            }}
+            QMenuBar::item:selected {{ background: rgba(0, 0, 0, 70); }}
+            QComboBox {{
+                color: {self.settings.text_color};
+                background: rgba(0, 0, 0, 42);
+                border: 1px solid rgba(255, 255, 255, 35);
+                border-radius: 2px;
+                padding: 1px 6px;
+                min-height: 18px;
+            }}
+            QComboBox:hover {{
+                background: rgba(0, 0, 0, 68);
+                border-color: rgba(255, 255, 255, 80);
+            }}
+            QComboBox::drop-down {{ border: none; width: 18px; }}
+            QComboBox QAbstractItemView {{
+                color: {self.settings.text_color};
+                background: rgba(22, 25, 30, 235);
+                border: 1px solid rgba(255, 255, 255, 55);
+            }}
+            QPushButton {{
+                color: {self.settings.text_color};
+                background: rgba(0, 0, 0, 42);
+                border: 1px solid rgba(255, 255, 255, 35);
+                border-radius: 2px;
+                min-width: 28px;
+                padding: 1px 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba(0, 0, 0, 74);
+                border-color: rgba(255, 255, 255, 90);
+            }}
+            QLabel {{ background: transparent; }}
+            QScrollBar:vertical {{ width: 8px; background: transparent; }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 55);
+                min-height: 24px;
+            }}
             """
         )
         self.progress_label.setStyleSheet(f"color: {self.settings.text_color};")
-        self.setWindowOpacity(
-            self.settings.visible_opacity if self.preview_locked else self.settings.hidden_opacity
+        self._apply_window_opacity()
+
+    def _reader_font(self) -> QFont:
+        font = QFont(self.settings.font_family)
+        font.setPointSize(self.settings.font_size)
+        return font
+
+    def _apply_document_format(self, font: QFont) -> None:
+        document = self.text.document()
+        document.setDefaultFont(font)
+        cursor = QTextCursor(document)
+        cursor.select(QTextCursor.SelectionType.Document)
+
+        character_format = QTextCharFormat()
+        character_format.setFont(font)
+        cursor.mergeCharFormat(character_format)
+
+        block_format = QTextBlockFormat()
+        block_format.setLineHeight(
+            line_height_percent(self.settings.line_spacing),
+            QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
         )
+        cursor.mergeBlockFormat(block_format)
+
+    def _apply_window_opacity(self) -> None:
+        target = (
+            self.settings.visible_opacity
+            if self.preview_locked or self._mouse_inside
+            else self.settings.hidden_opacity
+        )
+        if abs(self.windowOpacity() - target) > 0.001:
+            self.setWindowOpacity(target)
+
+    def _set_mouse_inside(self, inside: bool) -> None:
+        if self._mouse_inside == inside:
+            return
+        self._mouse_inside = inside
+        self._apply_window_opacity()
 
     def enterEvent(self, event) -> None:
+        self.hover_leave_timer.stop()
+        self._set_mouse_inside(True)
         self.progress_label.setVisible(True)
         self.update_progress_label()
-        self.setWindowOpacity(self.settings.visible_opacity)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         if self.preview_locked:
             super().leaveEvent(event)
             return
-        self.progress_label.setVisible(False)
-        self.setWindowOpacity(self.settings.hidden_opacity)
+        self.hover_leave_timer.start()
         super().leaveEvent(event)
+
+    def _confirm_mouse_left(self) -> None:
+        if self.preview_locked:
+            return
+        if self.geometry().contains(QCursor.pos()):
+            self._set_mouse_inside(True)
+            return
+        self.progress_label.setVisible(False)
+        self._set_mouse_inside(False)
 
     def open_file_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "打开 EPUB", "", "EPUB 电子书 (*.epub)")
@@ -388,11 +532,11 @@ class ReaderWindow(QMainWindow):
         self.apply_settings()
         self.progress_label.setVisible(True)
         self.update_progress_label()
-        self.setWindowOpacity(self.settings.visible_opacity)
 
     def end_preview_appearance(self) -> None:
         self.preview_locked = False
-        self.progress_label.setVisible(False)
+        self._mouse_inside = self.geometry().contains(QCursor.pos())
+        self.progress_label.setVisible(self._mouse_inside)
         self.apply_settings()
 
     def load_book(self, path: Path) -> None:
@@ -426,6 +570,7 @@ class ReaderWindow(QMainWindow):
         self.stop_smooth_scroll(clear_target=True)
         self.current_chapter_index = min(max(0, index), len(self.document.chapters) - 1)
         self.text.setPlainText(self.document.chapter_text(self.current_chapter_index))
+        self._apply_document_format(self._reader_font())
         self.text.verticalScrollBar().setValue(max(0, offset))
         self.chapter_box.blockSignals(True)
         self.chapter_box.setCurrentIndex(self.current_chapter_index)
@@ -463,6 +608,42 @@ class ReaderWindow(QMainWindow):
 
     def next_chapter(self) -> None:
         self.show_chapter(self.current_chapter_index + 1, 0)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self.handle_chapter_key(event, mouse_over_text=self.text.viewport().underMouse()):
+            return
+        super().keyPressEvent(event)
+
+    def handle_chapter_key(self, event: QKeyEvent, mouse_over_text: bool) -> bool:
+        if not mouse_over_text or not self.document:
+            return False
+
+        modifiers = event.modifiers()
+        blocked_modifiers = (
+            Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        if modifiers & blocked_modifiers:
+            return False
+
+        if event.key() == Qt.Key.Key_Left:
+            direction = ChapterDirection.PREVIOUS
+        elif event.key() == Qt.Key.Key_Right:
+            direction = ChapterDirection.NEXT
+        else:
+            return False
+
+        destination = chapter_destination(
+            self.current_chapter_index,
+            len(self.document.chapters),
+            direction,
+        )
+        if destination is not None:
+            self.show_chapter(destination, 0)
+        event.accept()
+        return True
 
     def handle_wheel(self, event: QWheelEvent) -> None:
         scroll_bar = self.text.verticalScrollBar()
@@ -519,14 +700,25 @@ class ReaderWindow(QMainWindow):
         super().resizeEvent(event)
 
     def eventFilter(self, watched, event: QEvent) -> bool:
-        if not self._is_interaction_surface(watched):
+        if not self._is_resize_widget(watched):
             return super().eventFilter(watched, event)
+
+        if event.type() == QEvent.Type.Enter:
+            self.hover_leave_timer.stop()
+            self._set_mouse_inside(True)
+        elif event.type() == QEvent.Type.Leave and not self.preview_locked:
+            self.hover_leave_timer.start()
 
         if event.type() == QEvent.Type.MouseButtonPress:
             mouse_event = event
             if isinstance(mouse_event, QMouseEvent) and mouse_event.button() == Qt.MouseButton.LeftButton:
-                self._begin_window_interaction(mouse_event.globalPosition().toPoint())
-                return True
+                global_pos = mouse_event.globalPosition().toPoint()
+                if self._resize_edges_at(global_pos) != ResizeEdges.NONE:
+                    self._begin_window_interaction(global_pos)
+                    return True
+                if self._is_drag_surface(watched):
+                    self._begin_window_interaction(global_pos)
+                    return True
 
         if event.type() == QEvent.Type.MouseMove:
             mouse_event = event
@@ -542,18 +734,24 @@ class ReaderWindow(QMainWindow):
 
         if event.type() == QEvent.Type.MouseButtonRelease:
             mouse_event = event
-            if isinstance(mouse_event, QMouseEvent) and mouse_event.button() == Qt.MouseButton.LeftButton:
+            if (
+                isinstance(mouse_event, QMouseEvent)
+                and mouse_event.button() == Qt.MouseButton.LeftButton
+                and (self._drag_start_global is not None or self._resize_start_global is not None)
+            ):
                 self._end_window_interaction()
                 return True
 
         return super().eventFilter(watched, event)
 
-    def _is_interaction_surface(self, watched) -> bool:
+    def _is_resize_widget(self, watched) -> bool:
+        return watched in self._resize_widgets
+
+    def _is_drag_surface(self, watched) -> bool:
         return watched in {self, self.centralWidget(), self.text, self.text.viewport()}
 
     def _begin_window_interaction(self, global_pos: QPoint) -> None:
-        local_pos = self.mapFromGlobal(global_pos)
-        edges = edge_at(local_pos.x(), local_pos.y(), self.width(), self.height())
+        edges = self._resize_edges_at(global_pos)
         if edges != ResizeEdges.NONE:
             geometry = self.geometry()
             self._resize_edges = edges
@@ -593,8 +791,7 @@ class ReaderWindow(QMainWindow):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _update_resize_cursor(self, global_pos: QPoint) -> None:
-        local_pos = self.mapFromGlobal(global_pos)
-        edges = edge_at(local_pos.x(), local_pos.y(), self.width(), self.height())
+        edges = self._resize_edges_at(global_pos)
         cursor_map = {
             ResizeEdges.TOP | ResizeEdges.LEFT: Qt.CursorShape.SizeFDiagCursor,
             ResizeEdges.BOTTOM | ResizeEdges.RIGHT: Qt.CursorShape.SizeFDiagCursor,
@@ -606,6 +803,10 @@ class ReaderWindow(QMainWindow):
             ResizeEdges.BOTTOM: Qt.CursorShape.SizeVerCursor,
         }
         self.setCursor(cursor_map.get(edges, Qt.CursorShape.ArrowCursor))
+
+    def _resize_edges_at(self, global_pos: QPoint) -> ResizeEdges:
+        local_pos = self.mapFromGlobal(global_pos)
+        return edge_at(local_pos.x(), local_pos.y(), self.width(), self.height())
 
 
 def main() -> int:

@@ -1,18 +1,18 @@
 import Foundation
 
-public struct EpubBook: Equatable {
+public struct EpubBook: Codable, Equatable, Sendable {
     public let title: String
     public let chapters: [EpubChapter]
     public let sourceURL: URL
 }
 
-public struct EpubChapter: Equatable, Identifiable {
+public struct EpubChapter: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let title: String
     public let text: String
 }
 
-public enum EpubParserError: Error, Equatable, LocalizedError {
+public enum EpubParserError: Error, Equatable, LocalizedError, Sendable {
     case missingContainer
     case missingRootfile
     case missingPackage(String)
@@ -44,7 +44,7 @@ public enum EpubParserError: Error, Equatable, LocalizedError {
     }
 }
 
-public struct EpubParser {
+public struct EpubParser: Sendable {
     fileprivate static let xhtmlEntityReplacements = [
         "&nbsp;": " ",
         "&ensp;": " ",
@@ -114,10 +114,15 @@ public struct EpubParser {
                 return nil
             }
 
+            let title = extraction.preferredTitle
+            if extraction.isTableOfContents {
+                return nil
+            }
+
             let fallbackTitle = chapterURL.deletingPathExtension().lastPathComponent
             return EpubChapter(
                 id: idref,
-                title: extraction.title.isEmpty ? fallbackTitle : extraction.title,
+                title: title.isEmpty ? fallbackTitle : title,
                 text: extraction.text
             )
         }
@@ -189,6 +194,7 @@ public struct EpubParser {
 
             return ChapterExtraction(
                 title: delegate.title.normalizedBookText(),
+                bodyHeading: delegate.bodyHeading.normalizedBookText(),
                 text: text
             )
         } catch EpubParserError.malformedXML {
@@ -281,7 +287,7 @@ public struct EpubParser {
             throw EpubParserError.unreadableChapter(sourceDescription)
         }
 
-        return ChapterExtraction(title: title, text: text)
+        return ChapterExtraction(title: title, bodyHeading: "", text: text)
     }
 
     private func firstCapture(in text: String, pattern: String) -> String? {
@@ -319,7 +325,25 @@ private struct PackageDocument {
 
 private struct ChapterExtraction {
     let title: String
+    let bodyHeading: String
     let text: String
+
+    var preferredTitle: String {
+        let normalizedHeading = bodyHeading.normalizedBookText()
+        let normalizedTitle = title.normalizedBookText()
+        return normalizedTitle == "未知" || normalizedTitle.isEmpty ? normalizedHeading : normalizedTitle
+    }
+
+    var isTableOfContents: Bool {
+        let normalizedTitle = preferredTitle.lowercased()
+        guard ["contents", "目录", "table of contents"].contains(normalizedTitle) else {
+            return false
+        }
+
+        let chapterLines = text.components(separatedBy: .newlines)
+            .filter { $0.contains("第") && $0.contains("章") }
+        return chapterLines.count >= 5
+    }
 }
 
 private final class ContainerXMLDelegate: NSObject, XMLParserDelegate {
@@ -390,10 +414,12 @@ private final class PackageXMLDelegate: NSObject, XMLParserDelegate {
 
 private final class XHTMLTextDelegate: NSObject, XMLParserDelegate {
     private(set) var title = ""
+    private(set) var bodyHeading = ""
     private(set) var text = ""
 
     private var isInBody = false
     private var isReadingHeadTitle = false
+    private var isReadingBodyHeading = false
     private var ignoredDepth = 0
 
     func parser(
@@ -423,6 +449,9 @@ private final class XHTMLTextDelegate: NSObject, XMLParserDelegate {
         }
 
         if ignoredDepth == 0 {
+            if name == "h1", bodyHeading.isEmpty {
+                isReadingBodyHeading = true
+            }
             if name == "br" {
                 appendLineBreak()
             } else if htmlBlockElementNames.contains(name) {
@@ -456,6 +485,10 @@ private final class XHTMLTextDelegate: NSObject, XMLParserDelegate {
             appendLineBreak()
         }
 
+        if name == "h1" {
+            isReadingBodyHeading = false
+        }
+
         if name == "body" {
             isInBody = false
         }
@@ -471,6 +504,9 @@ private final class XHTMLTextDelegate: NSObject, XMLParserDelegate {
             return
         }
 
+        if isReadingBodyHeading {
+            bodyHeading += string
+        }
         appendText(string)
     }
 

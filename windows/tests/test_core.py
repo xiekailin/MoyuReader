@@ -4,6 +4,8 @@ from pathlib import Path
 
 from moyureader_win.epub import EpubParser, build_test_epub
 from moyureader_win.models import EpubBook, EpubChapter, ReadingDocument
+from moyureader_win.reader_formatting import line_height_percent
+from moyureader_win.chapter_navigation import ChapterDirection, chapter_destination
 from moyureader_win.scrolling import animation_interval_ms, next_offset, progress_percent, smoothed_offset
 from moyureader_win.settings import ReaderSettings
 from moyureader_win.store import LibraryStore, ProgressStore, ReadingProgress
@@ -113,3 +115,44 @@ def test_window_geometry_resizes_from_top_left_and_keeps_minimum() -> None:
     assert clamped.height == 100
     assert clamped.right == start.right
     assert clamped.bottom == start.bottom
+
+
+def test_window_geometry_resizes_from_top_and_bottom_edges() -> None:
+    start = WindowGeometry(100, 200, 720, 220)
+
+    assert edge_at(360, 2, 720, 220) == ResizeEdges.TOP
+    assert edge_at(360, 218, 720, 220) == ResizeEdges.BOTTOM
+    assert resize_geometry(start, 0, -40, ResizeEdges.TOP) == WindowGeometry(100, 160, 720, 260)
+    assert resize_geometry(start, 0, 40, ResizeEdges.BOTTOM) == WindowGeometry(100, 200, 720, 260)
+
+
+def test_reader_window_styles_controls_and_tracks_all_resize_surfaces() -> None:
+    source = (Path(__file__).resolve().parents[1] / "moyureader_win" / "app.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "QComboBox {" in source
+    assert "QPushButton {" in source
+    assert "QMenuBar {" in source
+    assert "self.menuBar()," in source
+    assert "self.chapter_box," in source
+    assert "self.previous_button," in source
+    assert "self.next_button," in source
+    assert "def reader_window(self)" in source
+    assert "QEvent.Type.Enter" in source
+    assert "QEvent.Type.Leave" in source
+
+
+def test_line_height_percent_is_visible_and_clamped() -> None:
+    assert line_height_percent(0) == 100
+    assert line_height_percent(8) == 140
+    assert line_height_percent(18) == 190
+    assert line_height_percent(-5) == 100
+    assert line_height_percent(99) == 190
+
+
+def test_chapter_navigation_stops_at_book_boundaries() -> None:
+    assert chapter_destination(0, 3, ChapterDirection.PREVIOUS) is None
+    assert chapter_destination(2, 3, ChapterDirection.NEXT) is None
+    assert chapter_destination(1, 3, ChapterDirection.PREVIOUS) == 0
+    assert chapter_destination(1, 3, ChapterDirection.NEXT) == 2

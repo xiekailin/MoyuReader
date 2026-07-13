@@ -130,6 +130,24 @@ struct EpubParserTests {
         #expect(book.chapters[0].text == "Loose Chapter\nFirst line\nSecond line")
     }
 
+    @Test("uses the body heading when the HTML title is generic")
+    func usesBodyHeadingWhenHTMLTitleIsGeneric() throws {
+        let epubURL = try TestEpubBuilder()
+            .addRawChapter(
+                id: "chapter-one",
+                href: "Text/chapter1.xhtml",
+                contents: """
+                <html><head><title>未知</title></head>
+                <body><h1>第1章 回魂压棺</h1><p>正文内容。</p></body></html>
+                """
+            )
+            .build()
+
+        let book = try EpubParser().parse(epubURL)
+
+        #expect(book.chapters[0].title == "第1章 回魂压棺")
+    }
+
     @Test("skips unreadable spine items when other chapters are readable")
     func skipsUnreadableSpineItemsWhenOtherChaptersAreReadable() throws {
         let epubURL = try TestEpubBuilder()
